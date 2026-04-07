@@ -14,19 +14,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          node-version: '20'
+          python-version: '3.11'
 
-      - name: Install Claude Code
-        run: npm install -g @anthropic-ai/claude-code
+      - name: Install dependencies
+        run: pip install anthropic requests
 
       - name: Run AURA Agent
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-        run: |
-          PROMPT=$(envsubst < prompts/aura-horario.txt)
-          claude -p "$PROMPT" --allowedTools "Bash,WebFetch" --dangerously-skip-permissions
+        run: python scripts/aura_horario.py
