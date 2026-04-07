@@ -1,0 +1,32 @@
+name: AURA - Agente Horario (Tarefas + Exames)
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # Toda hora
+  workflow_dispatch:       # Disparo manual para testes
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run AURA Agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          PROMPT=$(envsubst < prompts/aura-horario.txt)
+          claude -p "$PROMPT" --allowedTools "Bash,WebFetch" --dangerously-skip-permissions
