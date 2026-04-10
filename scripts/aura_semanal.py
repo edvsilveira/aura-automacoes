@@ -286,7 +286,7 @@ def main():
             {"property":"Data da transação","date":{"on_or_before":str(mes_fim)}},
         ]})
         for p in balanco:
-            valor    = get_number(p, "Valor") or 0
+            valor    = get_number(p, "Valor ") or 0  # propriedade tem espaço no final
             carater  = get_select(p, "Caráter") or ""
             resp     = get_select(p, "Responsável") or ""
             data_tx  = get_date(p, "Data da transação") or ""
