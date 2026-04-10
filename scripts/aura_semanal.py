@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
 """
-AURA - Agente Semanal
+AURA - Agente Semanal (sem dependência de IA)
 Toda sexta-feira: busca dados do Notion, cria página de análise, notifica Slack.
 """
 
 import os
-import json
 import requests
 import calendar
-from datetime import datetime, date, timedelta
-import anthropic
+from datetime import date, timedelta
 
-# --- Credenciais ---
 NOTION_TOKEN      = os.environ["NOTION_TOKEN"]
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK"]
-client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -22,7 +18,6 @@ NOTION_HEADERS = {
     "Content-Type": "application/json",
 }
 
-# --- IDs ---
 BALANCO_DB      = "238f915e8d4f80a7ae63e166f6f3e50f"
 METAS_DB        = "248f915e8d4f8003bcc7e513490b0603"
 RENOVACOES_DB   = "245f915e8d4f803e9a7cc220338cb568"
@@ -30,13 +25,15 @@ CRM_LEADS_DB    = "2e7f915e8d4f807e8fb4fa615f02bd15"
 ERP_PARENT_PAGE = "322f915e8d4f80229ec1d2748e174d1a"
 
 MESES_PT = {
-    1: "JANEIRO", 2: "FEVEREIRO", 3: "MARÇO", 4: "ABRIL",
-    5: "MAIO", 6: "JUNHO", 7: "JULHO", 8: "AGOSTO",
-    9: "SETEMBRO", 10: "OUTUBRO", 11: "NOVEMBRO", 12: "DEZEMBRO",
+    1:"JANEIRO",2:"FEVEREIRO",3:"MARÇO",4:"ABRIL",5:"MAIO",6:"JUNHO",
+    7:"JULHO",8:"AGOSTO",9:"SETEMBRO",10:"OUTUBRO",11:"NOVEMBRO",12:"DEZEMBRO",
 }
+OWNER_COLORS = {"Lucas":"blue","AURA":"yellow","Luanna":"pink"}
 
-OWNER_COLORS = {"Lucas": "blue", "AURA": "yellow", "Luanna": "pink"}
 
+# ============================================================
+# Helpers de data e número
+# ============================================================
 
 def numero_semana(day):
     if day <= 7:  return 1
@@ -45,22 +42,75 @@ def numero_semana(day):
     if day <= 28: return 4
     return 5
 
+def fmt_brl(v):
+    try:
+        s = f"{float(v):,.2f}"
+        s = s.replace(",","X").replace(".",",").replace("X",".")
+        return f"R${s}"
+    except Exception:
+        return "R$0,00"
+
+def pct(valor, meta):
+    try:
+        return round(float(valor) / float(meta) * 100, 1) if float(meta) > 0 else 0.0
+    except Exception:
+        return 0.0
+
+def fmt_dd_mm(d_str):
+    try:
+        return d_str[8:10] + "/" + d_str[5:7]
+    except Exception:
+        return ""
+
+def in_range(d_str, start, end):
+    try:
+        d = d_str[:10]
+        return str(start) <= d <= str(end)
+    except Exception:
+        return False
+
 
 # ============================================================
-# Helpers Notion
+# Extratores de propriedades Notion
 # ============================================================
 
-def notion_query(db_id, filter_obj=None, sorts=None):
-    """Query all pages from a database, handling pagination."""
+def get_title(page, prop):
+    items = page["properties"].get(prop, {}).get("title", [])
+    return "".join(t.get("plain_text","") for t in items)
+
+def get_text(page, prop):
+    items = page["properties"].get(prop, {}).get("rich_text", [])
+    return "".join(t.get("plain_text","") for t in items)
+
+def get_select(page, prop):
+    s = page["properties"].get(prop, {}).get("select") or {}
+    return s.get("name")
+
+def get_status(page, prop):
+    s = page["properties"].get(prop, {}).get("status") or {}
+    return s.get("name")
+
+def get_number(page, prop):
+    return page["properties"].get(prop, {}).get("number")
+
+def get_date(page, prop):
+    d = page["properties"].get(prop, {}).get("date") or {}
+    return d.get("start")
+
+
+# ============================================================
+# Helpers Notion API
+# ============================================================
+
+def notion_query(db_id, filter_obj=None):
     results, cursor = [], None
     while True:
         body = {"page_size": 100}
         if filter_obj: body["filter"] = filter_obj
-        if sorts:      body["sorts"]  = sorts
         if cursor:     body["start_cursor"] = cursor
         r = requests.post(
             f"https://api.notion.com/v1/databases/{db_id}/query",
-            headers=NOTION_HEADERS, json=body
+            headers=NOTION_HEADERS, json=body,
         )
         r.raise_for_status()
         data = r.json()
@@ -69,132 +119,128 @@ def notion_query(db_id, filter_obj=None, sorts=None):
         cursor = data["next_cursor"]
     return results
 
-
 def notion_create_page(parent_id, title):
-    """Create an empty page and return its id + url."""
     r = requests.post(
         "https://api.notion.com/v1/pages",
         headers=NOTION_HEADERS,
         json={
             "parent": {"page_id": parent_id},
-            "icon": {"type": "emoji", "emoji": "📊"},
-            "properties": {"title": {"title": [{"text": {"content": title}}]}},
+            "icon": {"type":"emoji","emoji":"📊"},
+            "properties": {"title": {"title": [{"text":{"content":title}}]}},
             "children": [],
         },
     )
     r.raise_for_status()
     return r.json()
 
-
-def notion_append_blocks(block_id, children):
-    """Append blocks in batches of 50 (Notion limit per call)."""
+def notion_append(block_id, children):
     for i in range(0, len(children), 50):
-        batch = children[i:i+50]
         r = requests.patch(
             f"https://api.notion.com/v1/blocks/{block_id}/children",
             headers=NOTION_HEADERS,
-            json={"children": batch},
+            json={"children": children[i:i+50]},
         )
         r.raise_for_status()
 
 
 # ============================================================
-# Block builders
+# Construtores de blocos Notion
 # ============================================================
 
 def rt(text, bold=False, color=None):
-    ann = {
-        "bold": bold, "italic": False, "strikethrough": False,
-        "underline": False, "code": False, "color": color or "default",
-    }
-    return {"type": "text", "text": {"content": text}, "annotations": ann}
+    ann = {"bold":bold,"italic":False,"strikethrough":False,
+           "underline":False,"code":False,"color":color or "default"}
+    return {"type":"text","text":{"content":text},"annotations":ann}
 
+def callout(emoji, rich_text):
+    return {"object":"block","type":"callout","callout":{
+        "icon":{"type":"emoji","emoji":emoji},
+        "rich_text":rich_text,"color":"gray_background"}}
 
-def callout_block(emoji, rich_text):
-    return {
-        "object": "block", "type": "callout",
-        "callout": {
-            "icon": {"type": "emoji", "emoji": emoji},
-            "rich_text": rich_text,
-            "color": "gray_background",
-        },
-    }
+def h2(text):
+    return {"object":"block","type":"heading_2",
+            "heading_2":{"rich_text":[rt(text)]}}
 
+def para(rich_text):
+    return {"object":"block","type":"paragraph",
+            "paragraph":{"rich_text":rich_text}}
 
-def h2_block(text):
-    return {
-        "object": "block", "type": "heading_2",
-        "heading_2": {"rich_text": [rt(text)]},
-    }
+def bullet(rich_text):
+    return {"object":"block","type":"bulleted_list_item",
+            "bulleted_list_item":{"rich_text":rich_text}}
 
-
-def para_block(rich_text):
-    return {
-        "object": "block", "type": "paragraph",
-        "paragraph": {"rich_text": rich_text},
-    }
-
-
-def bullet_block(rich_text):
-    return {
-        "object": "block", "type": "bulleted_list_item",
-        "bulleted_list_item": {"rich_text": rich_text},
-    }
-
-
-def divider_block():
-    return {"object": "block", "type": "divider", "divider": {}}
-
-
-def fmt_brl(v):
-    try:
-        return f"R${float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    except Exception:
-        return "R$0,00"
-
-
-def pct(valor, meta):
-    try:
-        return round(float(valor) / float(meta) * 100, 1) if float(meta) > 0 else 0.0
-    except Exception:
-        return 0.0
+def divider():
+    return {"object":"block","type":"divider","divider":{}}
 
 
 # ============================================================
-# Serialização compacta para prompt
+# Geração de textos de análise
 # ============================================================
 
-def compact(pages, max_chars=6000):
-    """Return a compact JSON string of Notion pages (properties only)."""
-    out = []
-    for p in pages:
-        props = {}
-        for k, v in p.get("properties", {}).items():
-            ptype = v.get("type", "")
-            if ptype == "title":
-                props[k] = "".join(t.get("plain_text", "") for t in v.get("title", []))
-            elif ptype == "rich_text":
-                props[k] = "".join(t.get("plain_text", "") for t in v.get("rich_text", []))
-            elif ptype == "date":
-                d = v.get("date") or {}
-                props[k] = d.get("start")
-            elif ptype == "number":
-                props[k] = v.get("number")
-            elif ptype == "select":
-                s = v.get("select") or {}
-                props[k] = s.get("name")
-            elif ptype == "multi_select":
-                props[k] = [s.get("name") for s in v.get("multi_select", [])]
-            elif ptype == "formula":
-                f = v.get("formula") or {}
-                props[k] = f.get("number") or f.get("string")
-            elif ptype == "checkbox":
-                props[k] = v.get("checkbox")
-            elif ptype == "url":
-                props[k] = v.get("url")
-        out.append(props)
-    text = json.dumps(out, ensure_ascii=False)
-    return text[:max_chars] + ("..." if len(text) > max_chars else "")
+def leitura_faturamento(fat_total, meta_total, fat_lucas, meta_lucas,
+                         fat_aura, meta_aura, fat_luanna, meta_luanna):
+    pct_t = pct(fat_total, meta_total)
+    restante = meta_total - fat_total
+    lideres = sorted(
+        [("Lucas", pct(fat_lucas, meta_lucas)),
+         ("AURA",  pct(fat_aura,  meta_aura)),
+         ("Luanna",pct(fat_luanna,meta_luanna))],
+        key=lambda x: x[1], reverse=True
+    )
+    t = f"Acumulado de {fmt_brl(fat_total)} ({pct_t}% da meta). "
+    t += f"{lideres[0][0]} lidera com {lideres[0][1]}% da meta individual"
+    if lideres[1][1] > 0:
+        t += f", seguido de {lideres[1][0]} com {lideres[1][1]}%"
+    t += ". "
+    if restante > 0:
+        t += f"Faltam {fmt_brl(restante)} para bater a meta total do mês."
+    else:
+        t += "Meta total do mês atingida!"
+    return t
+
+def leitura_leads(total_semana, conversoes, frios, taxa_semana, total_mes, taxa_mes):
+    t = f"{total_semana} lead(s) na semana"
+    if total_semana > 0:
+        t += f", {conversoes} conversão(ões) imediata(s) (taxa de {taxa_semana}%)."
+    else:
+        t += " — nenhum novo lead registrado."
+    if frios > 0:
+        t += f" {frios} lead(s) frio(s) (apenas clicaram no link)."
+    t += f" No mês: {total_mes} leads com taxa de conversão de {taxa_mes}%."
+    return t
+
+def leitura_renovacoes(renovaram, perdidas, em_aberto, total_mes, taxa):
+    t = f"Taxa de renovação do mês: {taxa}% ({renovaram}/{total_mes}). "
+    if perdidas > 0:
+        t += f"{perdidas} não renovou(aram) no período. "
+    if em_aberto > 0:
+        t += f"{em_aberto} renovação(ões) ainda em aberto até o fim do mês — acompanhar."
+    else:
+        t += "Nenhuma renovação pendente em aberto."
+    return t
+
+def leitura_funil(total, vendas, pipeline, funil):
+    taxa = pct(vendas, total)
+    maior = max(funil.items(), key=lambda x: x[1]) if funil else ("—", 0)
+    t = f"{total} leads no mês, taxa de conversão de {taxa}%. "
+    t += f"Pipeline ativo com {pipeline} leads. "
+    if maior[1] > 0:
+        t += f"Maior concentração em '{maior[0]}' ({maior[1]} leads)."
+    return t
+
+def conclusao(fat_total, meta_total, total_leads_semana, conversoes_semana,
+               renovaram, total_ren, em_aberto):
+    pct_t = pct(fat_total, meta_total)
+    p1 = (f"O faturamento acumulado está em {fmt_brl(fat_total)} ({pct_t}% da meta). "
+          + ("Bom ritmo — manter foco nas conversões para fechar o mês acima da meta."
+             if pct_t >= 60 else "Ritmo abaixo do esperado — avaliar ações para acelerar vendas."))
+    p2 = (f"Na semana foram registrados {total_leads_semana} lead(s) com {conversoes_semana} "
+          f"conversão(ões). Acompanhar os leads quentes do pipeline para maximizar conversões.")
+    taxa_ren = pct(renovaram, total_ren)
+    p3 = (f"Taxa de renovação do mês em {taxa_ren}% ({renovaram}/{total_ren}). "
+          + (f"{em_aberto} renovação(ões) ainda em aberto — priorizar contato para fechar o mês."
+             if em_aberto > 0 else "Todas as renovações do mês resolvidas."))
+    return p1, p2, p3
 
 
 # ============================================================
@@ -212,356 +258,414 @@ def main():
     titulo        = f"AURA - {mes_nome} - SEMANA {num_semana}"
 
     print(f"AURA Agente Semanal — {today}")
-    print(f"Título: {titulo} | Semana: {inicio_semana} → {today} | Mês: {mes_inicio} → {mes_fim}")
+    print(f"Título: {titulo} | Semana: {inicio_semana}→{today} | Mês: {mes_inicio}→{mes_fim}")
 
     # ---- 1. Metas ----
     print("\n[1/4] Buscando metas...")
+    metas = {"Lucas": 25000, "AURA": 20000, "Luanna": 10000}
     try:
-        metas_raw = notion_query(METAS_DB)
-        metas_compact = compact(metas_raw, 3000)
+        for p in notion_query(METAS_DB):
+            nutri = get_title(p, "Nutri")
+            meta  = get_number(p, "Meta") or 0
+            if nutri in metas:
+                metas[nutri] = meta
+        print(f"  Metas: {metas}")
     except Exception as e:
-        print(f"  [ERRO] Metas: {e}")
-        metas_compact = "[]"
+        print(f"  [ERRO] Metas: {e} — usando valores padrão")
+    meta_total = sum(metas.values())
 
-    # ---- 2. Balanço Geral ----
+    # ---- 2. Balanço Geral (mês) ----
     print("[2/4] Buscando balanço geral...")
+    fat_mes   = {"Lucas":0.0,"AURA":0.0,"Luanna":0.0}
+    vendas_semana_list = []
+    despesas_semana_list = []
+    fat_semana = 0.0
     try:
-        balanco_raw = notion_query(BALANCO_DB)
-        balanco_compact = compact(balanco_raw, 8000)
+        balanco = notion_query(BALANCO_DB, filter_obj={"and":[
+            {"property":"Data da transação","date":{"on_or_after": str(mes_inicio)}},
+            {"property":"Data da transação","date":{"on_or_before":str(mes_fim)}},
+        ]})
+        for p in balanco:
+            valor    = get_number(p, "Valor") or 0
+            carater  = get_select(p, "Caráter") or ""
+            resp     = get_select(p, "Responsável") or ""
+            data_tx  = get_date(p, "Data da transação") or ""
+            nome_tx  = get_title(p, "Nome")
+            origem   = get_text(p, "Origem/Destino")
+            modo_pag = get_select(p, "Modo de Pagto") or ""
+
+            if carater != "Despesa" and valor > 0:
+                if resp in fat_mes:
+                    fat_mes[resp] += valor
+                if in_range(data_tx, inicio_semana, today):
+                    fat_semana += valor
+                    vendas_semana_list.append({
+                        "nome": origem or nome_tx,
+                        "valor": valor,
+                        "responsavel": resp,
+                        "produto": nome_tx,
+                        "forma_pag": modo_pag,
+                        "data_dd_mm": fmt_dd_mm(data_tx),
+                        "carater": carater,
+                    })
+            elif carater == "Despesa" and in_range(data_tx, inicio_semana, today):
+                despesas_semana_list.append({
+                    "nome": origem or nome_tx,
+                    "valor": abs(valor),
+                    "forma_pag": modo_pag,
+                    "data_dd_mm": fmt_dd_mm(data_tx),
+                })
+        fat_total_mes = sum(fat_mes.values())
+        print(f"  Faturamento mês: {fmt_brl(fat_total_mes)} | Semana: {fmt_brl(fat_semana)}")
     except Exception as e:
         print(f"  [ERRO] Balanço: {e}")
-        balanco_compact = "[]"
+        fat_total_mes = 0.0
 
-    # ---- 3. CRM Leads (mês inteiro) ----
+    # ---- 3. CRM Leads (mês) ----
     print("[3/4] Buscando leads do CRM...")
+    leads_semana_list  = []
+    funil              = {}
+    total_leads_mes    = 0
+    vendas_mes         = 0
+    pipeline_ativo     = 0
+    leads_frios_semana = 0
+    conversoes_semana  = 0
     try:
-        leads_raw = notion_query(CRM_LEADS_DB, filter_obj={
-            "and": [
-                {"property": "Primeiro contato", "date": {"on_or_after":  str(mes_inicio)}},
-                {"property": "Primeiro contato", "date": {"on_or_before": str(mes_fim)}},
-            ]
-        })
-        leads_compact = compact(leads_raw, 8000)
+        leads = notion_query(CRM_LEADS_DB, filter_obj={"and":[
+            {"property":"Primeiro contato","date":{"on_or_after": str(mes_inicio)}},
+            {"property":"Primeiro contato","date":{"on_or_before":str(mes_fim)}},
+        ]})
+        total_leads_mes = len(leads)
+        for p in leads:
+            status     = get_status(p, "Status") or "Sem status"
+            nutri      = get_select(p, "Nutricionista") or ""
+            origem     = get_select(p, "Origem") or ""
+            onde_parou = get_select(p, "Onde parou") or ""
+            nome_lead  = get_title(p, "Name")
+            data_pc    = get_date(p, "Primeiro contato") or ""
+
+            funil[status] = funil.get(status, 0) + 1
+
+            if status == "Venda":
+                vendas_mes += 1
+            if status not in ("Venda", "Desistiu"):
+                pipeline_ativo += 1
+
+            if in_range(data_pc, inicio_semana, today):
+                leads_semana_list.append({
+                    "nome":          nome_lead,
+                    "data_dd_mm":    fmt_dd_mm(data_pc),
+                    "nutricionista": nutri,
+                    "origem":        origem,
+                    "status":        status,
+                })
+                if status == "Venda":
+                    conversoes_semana += 1
+                if onde_parou == "Apenas clicou no link":
+                    leads_frios_semana += 1
+
+        total_leads_semana  = len(leads_semana_list)
+        taxa_conv_semana    = pct(conversoes_semana, total_leads_semana)
+        taxa_conv_mes       = pct(vendas_mes, total_leads_mes)
+        print(f"  Leads mês: {total_leads_mes} | Semana: {total_leads_semana} | Frios: {leads_frios_semana}")
     except Exception as e:
         print(f"  [ERRO] CRM Leads: {e}")
-        leads_compact = "[]"
+        total_leads_semana = taxa_conv_semana = taxa_conv_mes = 0
+        vendas_mes = pipeline_ativo = 0
 
-    # ---- 4. Renovações ----
+    # ---- 4. Renovações (mês) ----
     print("[4/4] Buscando renovações...")
+    renovacoes_semana_list = []
+    pipeline_ren_list      = []
+    renovaram_mes          = 0
+    antecipadas_mes        = 0
+    confirmadas_mes        = 0
+    perdidas_mes           = 0
+    em_aberto_mes          = 0
+    total_ren_mes          = 0
+    previstas_semana       = 0
+    confirmadas_semana     = 0
+    perdidas_semana        = 0
     try:
-        renovacoes_raw = notion_query(RENOVACOES_DB)
-        renovacoes_compact = compact(renovacoes_raw, 8000)
+        renovacoes = notion_query(RENOVACOES_DB, filter_obj={"and":[
+            {"property":"Data","date":{"on_or_after": str(mes_inicio)}},
+            {"property":"Data","date":{"on_or_before":str(mes_fim)}},
+        ]})
+        total_ren_mes = len(renovacoes)
+        for p in renovacoes:
+            nome_ren = get_title(p, "Nome")
+            data_ren = get_date(p, "Data") or ""
+            resp_ren = get_select(p, "Responsável") or ""
+            renovou  = get_status(p, "Renovou") or ""
+            consult  = get_status(p, "Consultoria") or ""
+
+            # Totais do mês
+            if renovou in ("Renovação", "Renovação Antecipada"):
+                renovaram_mes += 1
+                if renovou == "Renovação Antecipada":
+                    antecipadas_mes += 1
+                else:
+                    confirmadas_mes += 1
+            elif renovou == "Não renovou":
+                perdidas_mes += 1
+            elif renovou in ("Em andamento", "Mensagem enviada", "Entrar em contato"):
+                em_aberto_mes += 1
+
+            # Semana
+            if in_range(data_ren, inicio_semana, today):
+                previstas_semana += 1
+                ren_item = {
+                    "nome":        nome_ren,
+                    "data_dd_mm":  fmt_dd_mm(data_ren),
+                    "responsavel": resp_ren,
+                    "consultoria": consult,
+                    "status":      renovou,
+                }
+                renovacoes_semana_list.append(ren_item)
+                if renovou in ("Renovação", "Renovação Antecipada"):
+                    confirmadas_semana += 1
+                elif renovou == "Não renovou":
+                    perdidas_semana += 1
+
+            # Pipeline ativo (a partir de amanhã)
+            amanha = str(today + timedelta(days=1))
+            if (in_range(data_ren, amanha, mes_fim) and
+                    renovou in ("Em andamento", "Mensagem enviada")):
+                pipeline_ren_list.append({
+                    "nome":        nome_ren,
+                    "data_dd_mm":  fmt_dd_mm(data_ren),
+                    "responsavel": resp_ren,
+                    "consultoria": consult,
+                    "status":      renovou,
+                })
+
+        taxa_renovacao = pct(renovaram_mes, total_ren_mes)
+        print(f"  Renovações mês: {total_ren_mes} | Renovaram: {renovaram_mes} | Em aberto: {em_aberto_mes}")
     except Exception as e:
         print(f"  [ERRO] Renovações: {e}")
-        renovacoes_compact = "[]"
+        taxa_renovacao = 0.0
 
-    # ---- 5. Análise via Claude ----
-    print("\nAnalisando dados com IA...")
+    # ---- Textos de análise ----
+    leit_fat = leitura_faturamento(
+        fat_total_mes, meta_total,
+        fat_mes["Lucas"], metas["Lucas"],
+        fat_mes["AURA"],  metas["AURA"],
+        fat_mes["Luanna"],metas["Luanna"],
+    )
+    leit_leads = leitura_leads(
+        total_leads_semana, conversoes_semana, leads_frios_semana,
+        taxa_conv_semana, total_leads_mes, taxa_conv_mes,
+    )
+    leit_ren = leitura_renovacoes(renovaram_mes, perdidas_mes, em_aberto_mes,
+                                   total_ren_mes, taxa_renovacao)
+    leit_funil = leitura_funil(total_leads_mes, vendas_mes, pipeline_ativo, funil)
+    c1, c2, c3 = conclusao(fat_total_mes, meta_total, total_leads_semana,
+                            conversoes_semana, renovaram_mes, total_ren_mes, em_aberto_mes)
 
-    analysis_prompt = f"""Você é o analista de dados da AURA Consultoria.
-Analise os dados abaixo e retorne SOMENTE um JSON puro (sem markdown, sem explicações).
-
-DATAS:
-- hoje: {today}
-- inicio_semana (seg): {inicio_semana}
-- mes_inicio: {mes_inicio}
-- mes_fim: {mes_fim}
-- mes_nome: {mes_nome}
-- numero_semana: {num_semana}
-
-METAS DE FATURAMENTO (Notion — identifique mês={mes_nome}, extraia Lucas/AURA/Luanna):
-{metas_compact}
-
-BALANÇO GERAL (todas as transações — filtre por data para semana e mês):
-{balanco_compact}
-
-CRM DE LEADS (leads do mês — "Nutricionista" identifica responsável, "Primeiro contato" é a data de entrada):
-{leads_compact}
-
-RENOVAÇÕES (base única — "Consultoria"=Premium→Lucas ou Luanna / Comfort→AURA, "Data" para filtrar):
-{renovacoes_compact}
-
-REGRAS:
-- leads_frios_semana = leads da semana onde "Onde parou" = "Apenas clicou no link"
-- leads_semana = "Primeiro contato" entre {inicio_semana} e {today}
-- vendas_semana = transações financeiras com data entre {inicio_semana} e {today}
-- renovacoes_semana = renovações com "Data" entre {inicio_semana} e {today}
-- pipeline_ativo = renovações com "Data" entre {today} e {mes_fim} E status Em andamento OU Mensagem enviada
-- taxa_renovacao = renovaram_mes / total_renovacoes_mes × 100 (renovaram = Renovação + Renovação Antecipada)
-- Se não encontrar metas para o mês, use: lucas=25000, aura=20000, luanna=10000
-
-Retorne EXATAMENTE este JSON (sem texto fora dele):
-{{
-  "metas": {{"lucas": 0, "aura": 0, "luanna": 0, "total": 0}},
-  "financeiro": {{
-    "faturamento_semana": 0,
-    "faturamento_mes_lucas": 0,
-    "faturamento_mes_aura": 0,
-    "faturamento_mes_luanna": 0,
-    "faturamento_mes_total": 0,
-    "vendas_semana": [
-      {{"nome": "", "valor": 0, "responsavel": "", "produto": "", "forma_pag": "", "data_dd_mm": ""}}
-    ]
-  }},
-  "leads": {{
-    "total_semana": 0,
-    "conversoes_semana": 0,
-    "leads_frios_semana": 0,
-    "taxa_conversao_semana": 0.0,
-    "total_mes": 0,
-    "vendas_mes": 0,
-    "taxa_conversao_mes": 0.0,
-    "pipeline_ativo": 0,
-    "leads_semana": [
-      {{"nome": "", "data_dd_mm": "", "nutricionista": "", "origem": "", "status": ""}}
-    ],
-    "funil": {{
-      "Venda": 0, "Qualificação": 0, "Proposta feita": 0, "Novo": 0,
-      "Desistiu": 0, "Negociação": 0, "Link enviado": 0, "FUP": 0
-    }}
-  }},
-  "renovacoes": {{
-    "previstas_semana": 0,
-    "confirmadas_semana": 0,
-    "perdidas_semana": 0,
-    "renovaram_mes": 0,
-    "antecipadas_mes": 0,
-    "confirmadas_mes": 0,
-    "perdidas_mes": 0,
-    "em_aberto_mes": 0,
-    "total_mes": 0,
-    "taxa_renovacao": 0.0,
-    "renovacoes_semana": [
-      {{"nome": "", "data_dd_mm": "", "responsavel": "", "consultoria": "", "status": ""}}
-    ],
-    "pipeline_ativo": [
-      {{"nome": "", "data_dd_mm": "", "responsavel": "", "consultoria": "", "status": ""}}
-    ]
-  }},
-  "analises": {{
-    "leitura_faturamento": "",
-    "leitura_leads": "",
-    "leitura_renovacoes": "",
-    "leitura_funil": "",
-    "conclusao_p1": "",
-    "conclusao_p2": "",
-    "conclusao_p3": "",
-    "proximos_passos": ["", "", ""]
-  }}
-}}"""
-
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=4096,
-            messages=[{"role": "user", "content": analysis_prompt}],
-        )
-        raw = response.content[0].text.strip()
-        if "```" in raw:
-            raw = raw.split("```")[1]
-            if raw.startswith("json"): raw = raw[4:]
-        data = json.loads(raw)
-        print("  Análise concluída.")
-    except Exception as e:
-        print(f"  [ERRO] Análise IA: {e}")
-        return
-
-    m  = data["metas"]
-    f  = data["financeiro"]
-    l  = data["leads"]
-    r  = data["renovacoes"]
-    a  = data["analises"]
-
+    # ---- Construção dos blocos Notion ----
     ini     = inicio_semana.strftime("%d/%m")
     fim_sem = today.strftime("%d/%m")
     fim_mes = mes_fim.strftime("%d/%m")
 
-    pct_lucas  = pct(f["faturamento_mes_lucas"],  m["lucas"])
-    pct_aura   = pct(f["faturamento_mes_aura"],   m["aura"])
-    pct_luanna = pct(f["faturamento_mes_luanna"],  m["luanna"])
-    pct_total  = pct(f["faturamento_mes_total"],  m["total"])
+    pct_lucas  = pct(fat_mes["Lucas"],  metas["Lucas"])
+    pct_aura   = pct(fat_mes["AURA"],   metas["AURA"])
+    pct_luanna = pct(fat_mes["Luanna"], metas["Luanna"])
+    pct_total  = pct(fat_total_mes, meta_total)
     status_meta = "✅" if pct_total >= 90 else ("⚠️" if pct_total >= 60 else "🔴")
 
-    # ---- Construção dos blocos Notion ----
     blocks = []
 
     # === FATURAMENTO ===
-    blocks.append(callout_block("💰", [
+    blocks.append(callout("💰", [
         rt(f"Faturamento Mensal Acumulado — {mes_nome} {today.year}\n", bold=True),
-        rt("Meta do mês: "), rt(fmt_brl(m["total"]), bold=True),
-        rt(" · Total acumulado: "), rt(fmt_brl(f["faturamento_mes_total"]), bold=True, color="green"),
+        rt("Meta do mês: "), rt(fmt_brl(meta_total), bold=True),
+        rt(" · Total acumulado: "),
+        rt(fmt_brl(fat_total_mes), bold=True, color="green"),
         rt(f" — {pct_total}% da meta {status_meta}", bold=True),
     ]))
     blocks.append(bullet_block([
         rt("Lucas (Premium): ", bold=True),
-        rt(fmt_brl(f["faturamento_mes_lucas"]), color="blue"),
-        rt(f" / {fmt_brl(m['lucas'])} → "),
-        rt(f"{pct_lucas}%", bold=True),
+        rt(fmt_brl(fat_mes["Lucas"]), color="blue"),
+        rt(f" / {fmt_brl(metas['Lucas'])} → "), rt(f"{pct_lucas}%", bold=True),
     ]))
     blocks.append(bullet_block([
         rt("AURA (Comfort): ", bold=True),
-        rt(fmt_brl(f["faturamento_mes_aura"]), color="yellow"),
-        rt(f" / {fmt_brl(m['aura'])} → "),
-        rt(f"{pct_aura}%", bold=True),
+        rt(fmt_brl(fat_mes["AURA"]), color="yellow"),
+        rt(f" / {fmt_brl(metas['AURA'])} → "), rt(f"{pct_aura}%", bold=True),
     ]))
     blocks.append(bullet_block([
         rt("Luanna (Premium): ", bold=True),
-        rt(fmt_brl(f["faturamento_mes_luanna"]), color="pink"),
-        rt(f" / {fmt_brl(m['luanna'])} → "),
-        rt(f"{pct_luanna}%", bold=True),
+        rt(fmt_brl(fat_mes["Luanna"]), color="pink"),
+        rt(f" / {fmt_brl(metas['Luanna'])} → "), rt(f"{pct_luanna}%", bold=True),
     ]))
-    blocks.append(para_block([rt("Leitura: "), rt(a["leitura_faturamento"])]))
-    blocks.append(divider_block())
+    blocks.append(para([rt("Leitura: "), rt(leit_fat)]))
+    blocks.append(divider())
 
     # === VENDAS DA SEMANA ===
-    blocks.append(callout_block("📋", [
+    blocks.append(callout("📋", [
         rt(f"Vendas da Semana {num_semana} ({ini}–{fim_sem})\n", bold=True),
-        rt(f"{len(f['vendas_semana'])} venda(s) registrada(s) · Faturamento bruto: "),
-        rt(fmt_brl(f["faturamento_semana"]), bold=True, color="green"),
+        rt(f"{len(vendas_semana_list)} venda(s) registrada(s) · Faturamento bruto: "),
+        rt(fmt_brl(fat_semana), bold=True, color="green"),
     ]))
-    if f["vendas_semana"]:
-        for v in f["vendas_semana"]:
-            cor = OWNER_COLORS.get(v.get("responsavel", ""), "gray")
+    if vendas_semana_list:
+        for v in vendas_semana_list:
+            cor = OWNER_COLORS.get(v["responsavel"], "gray")
             blocks.append(bullet_block([
-                rt(fmt_brl(v.get("valor", 0)), bold=True, color="green"),
-                rt(f" ({v.get('forma_pag', '')}) — {v.get('nome', '')} — responsável: "),
-                rt(v.get("responsavel", ""), bold=True, color=cor),
-                rt(f" · {v.get('produto', '')} · {v.get('data_dd_mm', '')}"),
+                rt(fmt_brl(v["valor"]), bold=True, color="green"),
+                rt(f" ({v['carater']}, {v['forma_pag']}) — {v['nome']} — responsável: "),
+                rt(v["responsavel"], bold=True, color=cor),
+                rt(f" · {v['produto']} · {v['data_dd_mm']}"),
             ]))
     else:
-        blocks.append(para_block([rt("Nenhuma venda registrada no período.")]))
-    blocks.append(divider_block())
+        blocks.append(para([rt("Nenhuma venda registrada no período.")]))
+    if despesas_semana_list:
+        blocks.append(h2("Despesas da Semana"))
+        for d in despesas_semana_list:
+            blocks.append(bullet_block([
+                rt(fmt_brl(d["valor"]), bold=True, color="red"),
+                rt(f" ({d['forma_pag']}) — {d['nome']} · {d['data_dd_mm']}"),
+            ]))
+    else:
+        blocks.append(para([rt("Nenhuma despesa registrada no período.")]))
+    blocks.append(divider())
 
     # === CRM DE LEADS ===
-    blocks.append(callout_block("🎯", [
+    blocks.append(callout("🎯", [
         rt(f"CRM de Leads — Semana {num_semana} ({ini}–{fim_sem})\n", bold=True),
-        rt(f"{l['total_semana']} novo(s) lead(s) na semana · {l['conversoes_semana']} conversão(ões) imediata(s)"),
+        rt(f"{total_leads_semana} novo(s) lead(s) na semana · {conversoes_semana} conversão(ões) imediata(s)"),
     ]))
-    if l["leads_semana"]:
-        for lead in l["leads_semana"]:
-            cor = OWNER_COLORS.get(lead.get("nutricionista", ""), "gray")
-            status_cor = ("green" if lead.get("status") == "Venda"
-                          else "red" if lead.get("status") == "Desistiu" else None)
-            items = [
-                rt(f"{lead.get('nome', '')} — {lead.get('data_dd_mm', '')} — "),
-                rt(lead.get("nutricionista", ""), bold=True, color=cor),
-                rt(f" — {lead.get('origem', '')} → "),
-                rt(lead.get("status", ""), bold=True, color=status_cor) if status_cor
-                else rt(lead.get("status", "")),
-            ]
-            blocks.append(bullet_block(items))
+    if leads_semana_list:
+        for lead in leads_semana_list:
+            cor = OWNER_COLORS.get(lead["nutricionista"], "gray")
+            sc  = ("green" if lead["status"] == "Venda"
+                   else "red" if lead["status"] == "Desistiu" else None)
+            blocks.append(bullet_block([
+                rt(f"{lead['nome']} — {lead['data_dd_mm']} — "),
+                rt(lead["nutricionista"], bold=True, color=cor),
+                rt(f" — {lead['origem']} → "),
+                rt(lead["status"], bold=True, color=sc) if sc else rt(lead["status"]),
+            ]))
     else:
-        blocks.append(para_block([rt("Nenhum novo lead registrado no período.")]))
-    blocks.append(para_block([rt("Leitura: "), rt(a["leitura_leads"])]))
-    blocks.append(divider_block())
+        blocks.append(para([rt("Nenhum novo lead registrado no período.")]))
+    blocks.append(para([rt("Leitura: "), rt(leit_leads)]))
+    blocks.append(divider())
 
     # === RENOVAÇÕES ===
-    blocks.append(callout_block("🔄", [
+    blocks.append(callout("🔄", [
         rt(f"Renovações — Semana {num_semana} ({ini}–{fim_sem})\n", bold=True),
-        rt(f"{r['previstas_semana']} renovação(ões) prevista(s) na semana · "),
-        rt(f"{r['confirmadas_semana']} confirmada(s) · {r['perdidas_semana']} não renovou(aram)"),
+        rt(f"{previstas_semana} renovação(ões) prevista(s) na semana · "),
+        rt(f"{confirmadas_semana} confirmada(s) · {perdidas_semana} não renovou(aram)"),
     ]))
-    if r["renovacoes_semana"]:
-        for ren in r["renovacoes_semana"]:
-            cor = OWNER_COLORS.get(ren.get("responsavel", ""), "gray")
-            status_ren = ren.get("status", "")
-            status_cor = ("green" if "Renovação" in status_ren
-                          else "red" if "Não renovou" in status_ren else None)
+    if renovacoes_semana_list:
+        for ren in renovacoes_semana_list:
+            cor = OWNER_COLORS.get(ren["responsavel"], "gray")
+            sc  = ("green" if "Renovação" in ren["status"]
+                   else "red" if "Não renovou" in ren["status"] else None)
             blocks.append(bullet_block([
-                rt(f"{ren.get('nome', '')} — {ren.get('data_dd_mm', '')} — "),
-                rt(ren.get("responsavel", ""), bold=True, color=cor),
-                rt(f" — {ren.get('consultoria', '')} → "),
-                rt(status_ren, bold=True, color=status_cor) if status_cor else rt(status_ren),
+                rt(f"{ren['nome']} — {ren['data_dd_mm']} — "),
+                rt(ren["responsavel"], bold=True, color=cor),
+                rt(f" — {ren['consultoria']} → "),
+                rt(ren["status"], bold=True, color=sc) if sc else rt(ren["status"]),
             ]))
     else:
-        blocks.append(para_block([rt("Nenhuma renovação prevista para esta semana.")]))
+        blocks.append(para([rt("Nenhuma renovação prevista para esta semana.")]))
 
-    blocks.append(h2_block(f"Pipeline Ativo — Vencendo até {fim_mes}"))
-    if r["pipeline_ativo"]:
-        for p_item in r["pipeline_ativo"]:
-            cor = OWNER_COLORS.get(p_item.get("responsavel", ""), "gray")
+    blocks.append(h2(f"Pipeline Ativo — Vencendo até {fim_mes}"))
+    if pipeline_ren_list:
+        for p_item in pipeline_ren_list:
+            cor = OWNER_COLORS.get(p_item["responsavel"], "gray")
             blocks.append(bullet_block([
-                rt(f"{p_item.get('nome', '')} — {p_item.get('data_dd_mm', '')} — "),
-                rt(p_item.get("responsavel", ""), bold=True, color=cor),
-                rt(f" — {p_item.get('consultoria', '')} → {p_item.get('status', '')}"),
+                rt(f"{p_item['nome']} — {p_item['data_dd_mm']} — "),
+                rt(p_item["responsavel"], bold=True, color=cor),
+                rt(f" — {p_item['consultoria']} → {p_item['status']}"),
             ]))
     else:
-        blocks.append(para_block([rt("Nenhuma renovação em aberto até o fim do mês.")]))
-    blocks.append(para_block([rt("Leitura: "), rt(a["leitura_renovacoes"])]))
-    blocks.append(divider_block())
+        blocks.append(para([rt("Nenhuma renovação em aberto até o fim do mês.")]))
+    blocks.append(para([rt("Leitura: "), rt(leit_ren)]))
+    blocks.append(divider())
 
     # === FUNIL DO MÊS ===
-    funil = l["funil"]
-    blocks.append(callout_block("📊", [
+    STATUS_ORDER = ["Venda","Qualificação","Proposta feita","Novo",
+                    "Desistiu","Negociação","Link enviado"]
+    blocks.append(callout("📊", [
         rt(f"Funil do Mês — {mes_nome} {today.year}\n", bold=True),
-        rt(f"{l['total_mes']} leads no mês · Taxa de conversão: "),
-        rt(f"{l['taxa_conversao_mes']}%", bold=True),
-        rt(f" ({funil.get('Venda', 0)}/{l['total_mes']}) · Pipeline ativo: "),
-        rt(f"{l['pipeline_ativo']} leads", bold=True),
+        rt(f"{total_leads_mes} leads no mês · Taxa de conversão: "),
+        rt(f"{taxa_conv_mes}%", bold=True),
+        rt(f" ({vendas_mes}/{total_leads_mes}) · Pipeline ativo: "),
+        rt(f"{pipeline_ativo} leads", bold=True),
     ]))
-    blocks.append(bullet_block([rt("✅ Venda: ", bold=True, color="green"), rt(str(funil.get("Venda", 0)), bold=True, color="green")]))
-    blocks.append(bullet_block([rt(f"Qualificação: {funil.get('Qualificação', 0)}")]))
-    blocks.append(bullet_block([rt(f"Proposta feita: {funil.get('Proposta feita', 0)}")]))
-    blocks.append(bullet_block([rt(f"Novo: {funil.get('Novo', 0)}")]))
-    blocks.append(bullet_block([rt("Desistiu: ", bold=True, color="red"), rt(str(funil.get("Desistiu", 0)), bold=True, color="red")]))
-    blocks.append(bullet_block([rt(f"Negociação: {funil.get('Negociação', 0)}")]))
-    blocks.append(bullet_block([rt(f"Link enviado: {funil.get('Link enviado', 0)}")]))
-    blocks.append(bullet_block([rt(f"FUP (follow-up): {funil.get('FUP', 0)}")]))
-    blocks.append(para_block([rt("Leitura: "), rt(a["leitura_funil"])]))
-    blocks.append(divider_block())
+    for s in STATUS_ORDER:
+        n = funil.get(s, 0)
+        if s == "Venda":
+            blocks.append(bullet_block([rt("✅ Venda: ", bold=True, color="green"),
+                                        rt(str(n), bold=True, color="green")]))
+        elif s == "Desistiu":
+            blocks.append(bullet_block([rt("Desistiu: ", bold=True, color="red"),
+                                        rt(str(n), bold=True, color="red")]))
+        else:
+            blocks.append(bullet_block([rt(f"{s}: {n}")]))
+    # FUPs (qualquer status contendo "FUP" ou "Follow")
+    fup_total = sum(v for k, v in funil.items()
+                    if k not in STATUS_ORDER)
+    if fup_total > 0:
+        blocks.append(bullet_block([rt(f"Outros / FUP: {fup_total}")]))
+    blocks.append(para([rt("Leitura: "), rt(leit_funil)]))
+    blocks.append(divider())
 
     # === CONCLUSÃO EXECUTIVA ===
-    blocks.append(h2_block("Conclusão Executiva"))
-    blocks.append(para_block([rt(a["conclusao_p1"])]))
-    blocks.append(para_block([rt(a["conclusao_p2"])]))
-    blocks.append(para_block([rt(a["conclusao_p3"])]))
-    blocks.append(para_block([rt("")]))
-    blocks.append(para_block([rt("Próximos passos:", bold=True)]))
-    for passo in a.get("proximos_passos", []):
-        if passo:
-            blocks.append(bullet_block([rt(passo)]))
+    blocks.append(h2("Conclusão Executiva"))
+    blocks.append(para([rt(c1)]))
+    blocks.append(para([rt(c2)]))
+    blocks.append(para([rt(c3)]))
+    blocks.append(para([rt("")]))
+    blocks.append(para([rt("Próximos passos:", bold=True)]))
+    proximos = [
+        f"Acompanhar os {em_aberto_mes} lead(s) de renovação em aberto até {fim_mes}." if em_aberto_mes > 0 else "Monitorar pipeline de renovações para o próximo mês.",
+        f"Focar em converter os {pipeline_ativo} lead(s) ativos no CRM." if pipeline_ativo > 0 else "Intensificar captação de novos leads.",
+        f"Revisar estratégia para os {leads_frios_semana} lead(s) frio(s) da semana." if leads_frios_semana > 0 else "Manter qualidade na abordagem de novos leads.",
+    ]
+    for p_txt in proximos:
+        blocks.append(bullet_block([rt(p_txt)]))
 
-    # ---- Criar página e anexar blocos ----
+    # ---- Criar página Notion ----
     print("\nCriando página no Notion...")
     page_url = ""
     try:
-        page = notion_create_page(ERP_PARENT_PAGE, titulo)
+        page     = notion_create_page(ERP_PARENT_PAGE, titulo)
         page_id  = page["id"]
         page_url = page.get("url", "")
-        notion_append_blocks(page_id, blocks)
+        notion_append(page_id, blocks)
         print(f"  Página criada: {page_url}")
     except Exception as e:
-        print(f"  [ERRO] Página Notion: {e}")
+        print(f"  [ERRO] Página: {e}")
 
     # ---- Slack ----
     print("Enviando notificação Slack...")
-    slack_payload = {
-        "blocks": [
-            {"type": "header", "text": {"type": "plain_text", "text": f"📊 {titulo}"}},
-            {"type": "divider"},
-            {"type": "section", "text": {"type": "mrkdwn", "text": f"📅 *SEMANA ({ini}–{fim_sem})*"}},
-            {"type": "section", "text": {"type": "mrkdwn", "text": (
-                f"• *Faturamento:* {fmt_brl(f['faturamento_semana'])}\n"
-                f"• *Novos leads:* {l['total_semana']}  |  Vendas: {l['conversoes_semana']}  |  Conversão: {l['taxa_conversao_semana']}%\n"
-                f"   ↳ Leads frios (apenas clicaram no link): {l['leads_frios_semana']}\n"
-                f"• *Renovações:* {r['previstas_semana']} prevista(s) na semana\n"
-                f"   ↳ Previstas: {r['previstas_semana']}  |  Confirmadas: {r['confirmadas_semana']}  |  Perdidas: {r['perdidas_semana']}"
-            )}},
-            {"type": "divider"},
-            {"type": "section", "text": {"type": "mrkdwn", "text": f"📆 *{mes_nome} — ACUMULADO*"}},
-            {"type": "section", "text": {"type": "mrkdwn", "text": (
-                f"• *Faturamento:* {fmt_brl(f['faturamento_mes_total'])} — {pct_total}% da meta\n"
-                f"   ↳ Lucas: {pct_lucas}%  |  AURA: {pct_aura}%  |  Luanna: {pct_luanna}%\n"
-                f"• *Leads no mês:* {l['total_mes']}  |  Vendas: {l['vendas_mes']}  |  Conversão: {l['taxa_conversao_mes']}%\n"
-                f"• *Renovações:* {r['renovaram_mes']}/{r['total_mes']} — {r['taxa_renovacao']}% de taxa de renovação\n"
-                f"   ↳ Antecipadas: {r['antecipadas_mes']}  |  Confirmadas: {r['confirmadas_mes']}  |  Perdidas: {r['perdidas_mes']}  |  Em aberto: {r['em_aberto_mes']}"
-            )}},
-            {"type": "divider"},
-            {"type": "section", "text": {"type": "mrkdwn", "text": (
-                f"<{page_url}|Ver relatório no Notion>" if page_url else "Relatório criado no Notion."
-            )}},
-        ]
-    }
+    slack_payload = {"blocks": [
+        {"type":"header","text":{"type":"plain_text","text":f"📊 {titulo}"}},
+        {"type":"divider"},
+        {"type":"section","text":{"type":"mrkdwn","text":f"📅 *SEMANA ({ini}–{fim_sem})*"}},
+        {"type":"section","text":{"type":"mrkdwn","text":(
+            f"• *Faturamento:* {fmt_brl(fat_semana)}\n"
+            f"• *Novos leads:* {total_leads_semana}  |  Vendas: {conversoes_semana}  |  Conversão: {taxa_conv_semana}%\n"
+            f"   ↳ Leads frios (apenas clicaram no link): {leads_frios_semana}\n"
+            f"• *Renovações:* {previstas_semana} prevista(s) na semana\n"
+            f"   ↳ Previstas: {previstas_semana}  |  Confirmadas: {confirmadas_semana}  |  Perdidas: {perdidas_semana}"
+        )}},
+        {"type":"divider"},
+        {"type":"section","text":{"type":"mrkdwn","text":f"📆 *{mes_nome} — ACUMULADO*"}},
+        {"type":"section","text":{"type":"mrkdwn","text":(
+            f"• *Faturamento:* {fmt_brl(fat_total_mes)} — {pct_total}% da meta\n"
+            f"   ↳ Lucas: {pct_lucas}%  |  AURA: {pct_aura}%  |  Luanna: {pct_luanna}%\n"
+            f"• *Leads no mês:* {total_leads_mes}  |  Vendas: {vendas_mes}  |  Conversão: {taxa_conv_mes}%\n"
+            f"• *Renovações:* {renovaram_mes}/{total_ren_mes} — {taxa_renovacao}% de taxa de renovação\n"
+            f"   ↳ Antecipadas: {antecipadas_mes}  |  Confirmadas: {confirmadas_mes}  |  Perdidas: {perdidas_mes}  |  Em aberto: {em_aberto_mes}"
+        )}},
+        {"type":"divider"},
+        {"type":"section","text":{"type":"mrkdwn","text":(
+            f"<{page_url}|Ver relatório no Notion>" if page_url else "Relatório criado no Notion."
+        )}},
+    ]}
     try:
         resp = requests.post(SLACK_WEBHOOK_URL, json=slack_payload)
         print(f"  Slack: {'ok' if resp.text == 'ok' else resp.text}")
@@ -569,6 +673,11 @@ Retorne EXATAMENTE este JSON (sem texto fora dele):
         print(f"  [ERRO] Slack: {e}")
 
     print(f"\n=== Agente Semanal finalizado: {titulo} ===")
+
+
+def bullet_block(rich_text):
+    return {"object":"block","type":"bulleted_list_item",
+            "bulleted_list_item":{"rich_text":rich_text}}
 
 
 if __name__ == "__main__":
