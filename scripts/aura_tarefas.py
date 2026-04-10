@@ -56,6 +56,9 @@ def get_status_field(page, prop):
     s = page["properties"].get(prop, {}).get("status") or {}
     return s.get("name")
 
+def get_checkbox(page, prop):
+    return page["properties"].get(prop, {}).get("checkbox", False)
+
 def get_multi_select(page, prop):
     return [s.get("name") for s in page["properties"].get(prop, {}).get("multi_select", [])]
 
@@ -112,6 +115,10 @@ def main():
 
         if status in ("Concluida", "Concluída", "Done", "Concluido"):
             total_concluidas += 1
+            continue
+
+        # Ignora tarefas já conferidas
+        if get_checkbox(p, "Conferido"):
             continue
 
         nome   = get_title(p, "Tarefa") or "(sem título)"
@@ -174,28 +181,28 @@ def main():
         if tarefas["atrasadas"]:
             linhas = ["🚨 *ATRASADAS*"]
             for t in sorted(tarefas["atrasadas"], key=lambda x: x["dias"]):
-                st = f" — {t['status']}" if t.get("status") else ""
+                st = f" — *{t['status']}*" if t.get("status") else ""
                 linhas.append(f"• {t['nome']} ({t['prazo']}){st}")
             blocks.append(secao("\n".join(linhas)))
 
         if tarefas["proximas"]:
             linhas = ["⚠️ *PRÓXIMAS DO PRAZO*"]
             for t in sorted(tarefas["proximas"], key=lambda x: x["dias"]):
-                st = f" — {t['status']}" if t.get("status") else ""
+                st = f" — *{t['status']}*" if t.get("status") else ""
                 linhas.append(f"• {t['nome']} ({t['prazo']}){st}")
             blocks.append(secao("\n".join(linhas)))
 
         if tarefas["no_prazo"]:
             linhas = ["⏳ *DENTRO DO PRAZO*"]
             for t in sorted(tarefas["no_prazo"], key=lambda x: x["dias"]):
-                st = f" — {t['status']}" if t.get("status") else ""
+                st = f" — *{t['status']}*" if t.get("status") else ""
                 linhas.append(f"• {t['nome']} ({t['prazo']}){st}")
             blocks.append(secao("\n".join(linhas)))
 
         if tarefas["sem_prazo"]:
             linhas = ["❓ *SEM PRAZO*"]
             for t in tarefas["sem_prazo"]:
-                st = f" — {t['status']}" if t.get("status") else ""
+                st = f" — *{t['status']}*" if t.get("status") else ""
                 linhas.append(f"• {t['nome']}{st}")
             blocks.append(secao("\n".join(linhas)))
 
