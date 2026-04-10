@@ -1,0 +1,29 @@
+name: AURA - Gestao de Tarefas (Slack)
+
+on:
+  schedule:
+    - cron: '0 10 * * 0,3,5'  # Domingo, Quarta e Sexta às 10h UTC (7h SP)
+  workflow_dispatch:            # Disparo manual para testes
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run AURA Gestão de Tarefas
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          SLACK_WEBHOOK_TAREFAS: ${{ secrets.SLACK_WEBHOOK_TAREFAS }}
+        run: python scripts/aura_tarefas.py
