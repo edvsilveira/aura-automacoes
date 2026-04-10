@@ -10,7 +10,7 @@ import calendar
 from datetime import date, timedelta
 
 NOTION_TOKEN      = os.environ["NOTION_TOKEN"]
-SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK"]
+SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_RELATORIOS"]
 
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
