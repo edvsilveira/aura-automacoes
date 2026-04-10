@@ -1,0 +1,30 @@
+name: AURA - Agente Semanal (Análise)
+
+on:
+  schedule:
+    - cron: '0 8 * * 5'  # Toda sexta às 8h UTC (5h SP)
+  workflow_dispatch:       # Disparo manual para testes
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install anthropic requests
+
+      - name: Run AURA Agente Semanal
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: python scripts/aura_semanal.py
