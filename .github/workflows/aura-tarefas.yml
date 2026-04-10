@@ -25,5 +25,5 @@ jobs:
       - name: Run AURA Gestão de Tarefas
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          SLACK_WEBHOOK_TAREFAS: ${{ secrets.SLACK_WEBHOOK_TAREFAS }}
+          SLACK_WEBHOOK_TAREFAS: ${{ secrets.SLACK_WEBHOOK_GESTAOTAREFAS }}
         run: python scripts/aura_tarefas.py
